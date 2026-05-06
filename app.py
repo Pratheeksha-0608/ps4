@@ -152,44 +152,45 @@ def get_avg_engagement(creator_id, platform, content_type, time_slot,
     Returns:
         Average engagement value (float)
     """
-    # Query historical data
-    match = engagement_history[
-        (engagement_history['creator_id'] == creator_id) &
-        (engagement_history['platform'] == platform) &
-        (engagement_history['content_type'] == content_type) &
-        (engagement_history['time_slot'] == time_slot)
-    ]
-    
-    if len(match) > 0:
-        return float(match.iloc[0]['avg_engagement'])
-    
+    # Use cached dictionaries to avoid O(N) DataFrame lookups inside loops
+    if not hasattr(engagement_history, '_lookup_dict'):
+        engagement_history._lookup_dict = {
+            (r.creator_id, r.platform, r.content_type, r.time_slot): r.avg_engagement
+            for r in engagement_history.itertuples(index=False)
+        }
+    if not hasattr(creators_df, '_base_dict'):
+        creators_df._base_dict = {
+            r.creator_id: r.base_engagement
+            for r in creators_df.itertuples(index=False)
+        }
+        
+    key = (creator_id, platform, content_type, time_slot)
+    if key in engagement_history._lookup_dict:
+        return float(engagement_history._lookup_dict[key])
+        
     # Fallback to base engagement
-    creator_match = creators_df[creators_df['creator_id'] == creator_id]
-    if len(creator_match) > 0:
-        return float(creator_match.iloc[0]['base_engagement'])
+    if creator_id in creators_df._base_dict:
+        return float(creators_df._base_dict[creator_id])
     
     # Final fallback: return 1.0 (neutral engagement)
     return 1.0
 
 
-def calculate_score(creator_engagement, platform_activity, 
-                   creator_weight=0.60, platform_weight=0.40):
+def calculate_score(base_engagement, platform_activity, avg_engagement):
     """
-    Calculate weighted engagement score.
+    Calculate engagement score using multiplicative formula.
     
-    Formula: score = (creator_engagement * weight_creator) + 
-                     (platform_activity * weight_platform)
+    Formula: score = base_engagement * activity_score * avg_engagement
     
     Args:
-        creator_engagement: Historical engagement value
-        platform_activity: Platform activity score
-        creator_weight: Weight for creator engagement (default 0.60)
-        platform_weight: Weight for platform activity (default 0.40)
+        base_engagement: Creator's base engagement multiplier
+        platform_activity: Platform activity score at time slot
+        avg_engagement: Creator's average engagement for this combo
     
     Returns:
-        Weighted score (float)
+        Engagement score (float)
     """
-    return (creator_engagement * creator_weight) + (platform_activity * platform_weight)
+    return base_engagement * platform_activity * avg_engagement
 
 
 def find_best_posting_slot(content_row, engagement_history, creators_df, 
@@ -212,31 +213,47 @@ def find_best_posting_slot(content_row, engagement_history, creators_df,
     creator_id = content_row['creator_id']
     content_type = content_row['content_type']
     
+    # Use cached dictionary for creators base engagement
+    if not hasattr(creators_df, '_base_dict'):
+        creators_df._base_dict = {
+            r.creator_id: r.base_engagement
+            for r in creators_df.itertuples(index=False)
+        }
+
+    # Get creator's base engagement
+    if creator_id in creators_df._base_dict:
+        base_engagement = float(creators_df._base_dict[creator_id])
+    else:
+        base_engagement = 1.0
+        
+    # Cache platform activity to avoid O(N) DataFrame lookups
+    if not hasattr(platform_activity_df, '_lookup_dict'):
+        platform_activity_df._lookup_dict = {
+            (r.platform, r.time_slot): r.activity_score
+            for r in platform_activity_df.itertuples(index=False)
+        }
+        
     # Use negative scores for max-heap (Python's heapq is min-heap)
     heap = []
     
     # Evaluate all platform-time combinations
     for platform in ['Instagram', 'YouTube']:
         for time_slot in range(24):
-            # Get creator's engagement for this combination
-            creator_eng = get_avg_engagement(
+            # Get creator's average engagement for this combination
+            avg_engagement = get_avg_engagement(
                 creator_id, platform, content_type, time_slot,
                 engagement_history, creators_df
             )
             
-            # Get platform activity score for this combination
-            platform_match = platform_activity_df[
-                (platform_activity_df['platform'] == platform) &
-                (platform_activity_df['time_slot'] == time_slot)
-            ]
-            
-            if len(platform_match) > 0:
-                platform_activity = float(platform_match.iloc[0]['activity_score'])
+            # Get platform activity score for this combination using cache
+            key = (platform, time_slot)
+            if key in platform_activity_df._lookup_dict:
+                platform_activity = float(platform_activity_df._lookup_dict[key])
             else:
                 platform_activity = 0.5  # Default if missing
             
-            # Calculate score
-            score = calculate_score(creator_eng, platform_activity)
+            # Calculate score: base_engagement * activity_score * avg_engagement
+            score = calculate_score(base_engagement, platform_activity, avg_engagement)
             
             # Push to heap (negative for max-heap)
             heapq.heappush(heap, (-score, platform, time_slot, score))
@@ -288,25 +305,25 @@ def is_cooldown_respected(content_row, creators_df):
 
 def decide_timing(content_row, best_slot):
     """
-    Decide whether content should be posted IMMEDIATELY or SCHEDULED.
+    Decide whether content should be posted POST_NOW or SCHEDULE.
     
     Logic:
-    - High sensitivity → always IMMEDIATE
-    - Medium sensitivity → IMMEDIATE if best slot within 2 hours of creation, else SCHEDULED
-    - Low sensitivity → always SCHEDULED
+    - High sensitivity → always POST_NOW
+    - Medium sensitivity → POST_NOW if best slot within 2 hours of creation, else SCHEDULE
+    - Low sensitivity → always SCHEDULE
     
     Args:
         content_row: Series containing content information
         best_slot: Recommended time slot (0-23)
     
     Returns:
-        String: 'IMMEDIATE' or 'SCHEDULED'
+        String: 'POST_NOW' or 'SCHEDULE'
     """
     sensitivity = content_row['time_sensitivity']
     created_time = int(content_row['created_timestamp'])
     
     if sensitivity == 'High':
-        return 'IMMEDIATE'
+        return 'POST_NOW'
     
     elif sensitivity == 'Medium':
         # Check if best slot is within 2 hours
@@ -315,12 +332,12 @@ def decide_timing(content_row, best_slot):
         time_diff = min(time_diff, 24 - time_diff)
         
         if time_diff <= 2:
-            return 'IMMEDIATE'
+            return 'POST_NOW'
         else:
-            return 'SCHEDULED'
+            return 'SCHEDULE'
     
     else:  # Low sensitivity
-        return 'SCHEDULED'
+        return 'SCHEDULE'
 
 
 def generate_recommendations(content_df, creators_df, engagement_history_df, 
@@ -354,13 +371,19 @@ def generate_recommendations(content_df, creators_df, engagement_history_df,
         # Check cooldown
         cooldown_ok = is_cooldown_respected(content_row, creators_df)
         
+        # Map timing_decision back to old UI format
+        timing_ui = 'IMMEDIATE' if timing_decision == 'POST_NOW' else 'SCHEDULED'
+        
         # Create recommendation record
         recommendation = {
             'content_id': content_row['content_id'],
             'creator_id': content_row['creator_id'],
             'recommended_platform': best_slot_info['platform'],
+            'platform': best_slot_info['platform'],
             'best_time_slot': best_slot_info['time_slot'],
-            'timing': timing_decision,
+            'time_slot': best_slot_info['time_slot'],
+            'timing': timing_ui,
+            'decision': timing_decision,
             'final_score': round(best_slot_info['score'], 4),
             'cooldown_ok': cooldown_ok
         }
@@ -393,23 +416,39 @@ def create_time_slot_visualization(content_df, creators_df, engagement_history_d
     creator_id = content_row['creator_id']
     content_type = content_row['content_type']
     
+    if not hasattr(creators_df, '_base_dict'):
+        creators_df._base_dict = {
+            r.creator_id: r.base_engagement
+            for r in creators_df.itertuples(index=False)
+        }
+
+    if creator_id in creators_df._base_dict:
+        base_engagement = float(creators_df._base_dict[creator_id])
+    else:
+        base_engagement = 1.0
+
+    if not hasattr(platform_activity_df, '_lookup_dict'):
+        platform_activity_df._lookup_dict = {
+            (r.platform, r.time_slot): r.activity_score
+            for r in platform_activity_df.itertuples(index=False)
+        }
+
     scores_data = []
     
     for platform in ['Instagram', 'YouTube']:
         for time_slot in range(24):
-            creator_eng = get_avg_engagement(
+            avg_engagement = get_avg_engagement(
                 creator_id, platform, content_type, time_slot,
                 engagement_history_df, creators_df
             )
             
-            platform_match = platform_activity_df[
-                (platform_activity_df['platform'] == platform) &
-                (platform_activity_df['time_slot'] == time_slot)
-            ]
+            key = (platform, time_slot)
+            if key in platform_activity_df._lookup_dict:
+                platform_activity = float(platform_activity_df._lookup_dict[key])
+            else:
+                platform_activity = 0.5
             
-            platform_activity = float(platform_match.iloc[0]['activity_score']) if len(platform_match) > 0 else 0.5
-            
-            score = calculate_score(creator_eng, platform_activity)
+            score = calculate_score(base_engagement, platform_activity, avg_engagement)
             
             scores_data.append({
                 'time_slot': time_slot,
@@ -751,24 +790,25 @@ def main():
         # ====================================================================
         st.subheader("💾 Export Results")
         
-        # Convert to CSV
-        csv_output = recommendations_df.to_csv(index=False)
+        # Convert to CSV (submission format: content_id, platform, time_slot, decision)
+        submission_df = recommendations_df[['content_id', 'platform', 'time_slot', 'decision']]
+        csv_output = submission_df.to_csv(index=False)
         
         col1, col2 = st.columns(2)
         
         with col1:
             st.download_button(
-                label="⬇️ Download as CSV",
+                label="⬇️ Download as submission.csv",
                 data=csv_output,
-                file_name="recommendations.csv",
+                file_name="submission.csv",
                 mime="text/csv"
             )
         
         with col2:
             # Also save to file in the repo
-            output_path = "output.csv"
-            recommendations_df.to_csv(output_path, index=False)
-            st.success(f"✅ Results saved to {output_path}")
+            submission_path = "submission.csv"
+            submission_df.to_csv(submission_path, index=False)
+            st.success(f"✅ Results saved to {submission_path}")
         
         # ====================================================================
         # VISUALIZATIONS
